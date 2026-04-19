@@ -1,0 +1,7 @@
+yfinance
+plotly
+scipy
+typing
+arch
+pandas
+numpy
