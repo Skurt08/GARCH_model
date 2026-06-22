@@ -18,7 +18,7 @@ A Python implementation of a GARCH(1,1) model for volatility estimation and scen
 ## Project Structure
 
 ```
-├── gitignore
+├── .gitignore
 ├── requirements.txt
 ├── GARCH.py                          # Core model implementation
 └── Example_Return_Forecasting.ipynb  # Usage walkthrough & arch package comparison
