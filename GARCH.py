@@ -5,7 +5,6 @@ import numpy as np
 import scipy.stats as stats
 import plotly.io as pio
 from scipy.optimize import minimize
-from scipy.special import gamma
 from typing import Optional
 
 pio.renderers.default = "browser"
