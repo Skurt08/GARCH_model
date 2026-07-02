@@ -3,11 +3,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
 import scipy.stats as stats
-import plotly.io as pio
 from scipy.optimize import minimize
+from scipy.special import gammaln
+from statsmodels.stats.diagnostic import acorr_ljungbox
 from typing import Optional
-
-pio.renderers.default = "browser"
 
 def compute_log_returns(return_data: pd.Series) -> tuple[pd.Series, float]:
     log_returns = np.log(return_data / return_data.shift(1)).dropna()*100
@@ -15,37 +14,7 @@ def compute_log_returns(return_data: pd.Series) -> tuple[pd.Series, float]:
     log_returns -= return_mean
     return log_returns, return_mean
 
-def plot_returns(returns: pd.Series) -> go.Figure:
-    returns = returns.to_numpy()
-    x_values = np.linspace(returns.min(), returns.max(), 500)
-    kde = stats.gaussian_kde(returns)
-    empirical_pdf = kde(x_values)
-    mu, sigma = returns.mean(), returns.std()
-    normal_pdf = stats.norm.pdf(x_values, mu, sigma)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=empirical_pdf,
-        mode="lines",
-        name="Empirical PDF (KDE)"
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=normal_pdf,
-        mode="lines",
-        name="Normal PDF"
-    ))
-    fig.update_layout(
-        title="Distribution Comparison",
-        xaxis_title="Value",
-        yaxis_title="Density",
-    )
-
-    return fig
-
-def compute_conditional_vola(para: list[float], returns: pd.Series) -> float:
+def garch_negative_log_likelihood(para: list[float], returns: pd.Series) -> tuple[float, list[float]]:
 
     stabilisation_constant = max(0.0, para[0], para[1])
     ea = np.exp(para[0] - stabilisation_constant)
@@ -57,15 +26,25 @@ def compute_conditional_vola(para: list[float], returns: pd.Series) -> float:
     beta = eb / denominator
 
     omega = np.exp(para[2])
+    nu = 2.0 + np.exp(para[3])
+    log_const = gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(np.pi * (nu - 2))
     vola = [omega / (1-alpha-beta)]
+    '''
+    log_likelihood = (-log_const
+                      + 0.5 * np.log(vola[0])
+                      + ((nu + 1) / 2) * np.log(1 + returns[0]**2 / (vola[-1] * (nu - 2))))
+    '''
     log_likelihood = 0
 
     for i, ret in enumerate(returns[:-1]):
-        vola_i = omega + alpha * ret ** 2 + beta * vola[i]
-        log_likelihood += 0.5 * (np.log(vola_i) + returns[i+1] ** 2 / vola_i)
-        vola.append(vola_i)
+        vola.append(omega + alpha * ret ** 2 + beta * vola[-1])
+        log_likelihood += (-log_const
+                           + 0.5 * np.log(vola[-1])
+                           + ((nu + 1) / 2) * np.log(1 + returns[i + 1]**2 / (vola[-1] * (nu - 2))))
 
-    return log_likelihood
+    vola.append(omega + alpha * returns[-1] ** 2 + beta * vola[-1])
+
+    return log_likelihood, vola
 
 def optimize_garch_params(returns: pd.Series, starting_values: Optional[dict[str, float]] = None) -> dict:
 
@@ -83,35 +62,93 @@ def optimize_garch_params(returns: pd.Series, starting_values: Optional[dict[str
     alpha_start_hat = np.log(alpha_start / (1-alpha_start-beta_start))
     beta_start_hat = np.log(beta_start / (1-alpha_start-beta_start))
     omega_start_hat = np.log(omega_start)
+    nu_start_hat = np.log(6.0)
+    x0 = [alpha_start_hat, beta_start_hat, omega_start_hat, nu_start_hat]
+    conditional_vola = []
 
-    optimal_para_hat = minimize(compute_conditional_vola, [alpha_start_hat, beta_start_hat, omega_start_hat], args=(log_returns.values,))
+    def objective(para: list[float]) -> float:
+        nonlocal conditional_vola
+        likelihood, conditional_vola = garch_negative_log_likelihood(para, log_returns.values)
+        return likelihood
+
+
+    optimal_para_hat = minimize(objective, x0)
     denominator = 1 + np.exp(optimal_para_hat.x[0]) + np.exp(optimal_para_hat.x[1])
     alpha = np.exp(optimal_para_hat.x[0]) / denominator
     beta = np.exp(optimal_para_hat.x[1]) / denominator
     omega = np.exp(optimal_para_hat.x[2])
+    nu = 2.0 + np.exp(optimal_para_hat.x[3])
 
-    past_conditional_vola = filter_conditional_volatility(alpha, beta, omega, log_returns)
-    past_z_values = log_returns / past_conditional_vola[:-1]
+    past_z_values = log_returns[1:] / np.sqrt(conditional_vola[1:-1])
 
     garch_output = {"alpha": alpha,
                     "beta": beta,
                     "omega": omega,
+                    "nu": nu,
                     "implied unconditional variance": omega / (1-alpha-beta),
                     "sample unconditional variance": log_returns.values.var(),
                     "expected return": return_mean,
                     "return last period": log_returns.values[-1],
-                    "conditional vola t+1": past_conditional_vola[-1],
+                    "conditional vola t+1": conditional_vola[-1],
                     "past_z_values": past_z_values}
 
     return garch_output
 
-def filter_conditional_volatility(alpha: float, beta: float, omega: float, returns: pd.Series) -> list[float]:
+def plot_returns_t(returns: pd.Series, nu: float) -> go.Figure:
+    returns = returns.to_numpy()
 
-    conditional_volatility = [omega / (1-alpha-beta)]
-    for i, ret in enumerate(returns):
-        conditional_volatility.append(omega + alpha * ret**2 + beta * conditional_volatility[i])
+    x_values = np.linspace(returns.min(), returns.max(), 500)
 
-    return conditional_volatility
+    kde = stats.gaussian_kde(returns)
+    empirical_pdf = kde(x_values)
+    t_dist = stats.t(df=nu)
+    scale = np.sqrt(nu / (nu - 2)) if nu > 2 else np.nan
+
+    t_pdf = t_dist.pdf(x_values / scale) / scale
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=x_values,
+        y=empirical_pdf,
+        mode="lines",
+        name="Empirical KDE"
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=x_values,
+        y=t_pdf,
+        mode="lines",
+        name=f"Student-t PDF (ν={nu:.2f})"
+    ))
+
+    fig.update_layout(
+        title="Standardized Residual Distribution: KDE vs Student-t",
+        xaxis_title="Value",
+        yaxis_title="Density"
+    )
+
+    return fig
+
+
+def diagnose_z_values(past_z_values: pd.Series, estimated_nu: float):
+
+    plot_returns_t(past_z_values, estimated_nu).show()
+
+    print(f'mean z values: {round(past_z_values.mean(), 4)}')
+    print(f'std z values: {round(past_z_values.std(), 4)}')
+    if estimated_nu > 4:
+        print(f'empirical excess kurtosis z values: {past_z_values.kurtosis()}')
+        print(f'theoretical excess kurtosis z values: {6 / (estimated_nu - 4)}')
+    else: print('estimated degrees of freedom smaller or equal to 4, infinite kurtosis')
+
+    lb = acorr_ljungbox(past_z_values, lags=[10, 20], return_df=True)
+    print('Ljung-Box-Test for z values')
+    print(lb)
+
+    lb_sq = acorr_ljungbox(past_z_values ** 2, lags=[10, 20], return_df=True)
+    print('Ljung-Box-Test for z^2 values')
+    print(lb_sq)
 
 def forecast_scenario_based_returns(scenario_z_values: list[float], garch_output: dict[str, float]) -> np.ndarray:
 

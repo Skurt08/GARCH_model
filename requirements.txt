@@ -5,3 +5,4 @@ typing
 arch
 pandas
 numpy
+statsmodels
